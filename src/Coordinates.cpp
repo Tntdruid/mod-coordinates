@@ -11,12 +11,15 @@
  *     BOSSES             -> BOSS lines for the current instance, then BOSSEND
  *
  *   server -> addon  (CHAT_MSG_ADDON, prefix "AQCOORD", whispered from the player to themself)
- *     POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|->
+ *     POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|-> <worldMapAreaId|-> <floor|->
  *     BOSS <encounterIndex> <done 0/1> <entry> <x|-> <y|-> <z|-> <name>
+ *     BOSSMAP <encounterIndex> <worldMapAreaId> <floor> <mapX> <mapY> <exact 0/1>   (dungeon maps loaded)
  *     BOSSEND <map> <difficulty> <count>
  *
- * x/y/z are world coordinates (yards). mapX/mapY are the 0-100 zone map coordinates when the zone has a
- * world map, the same numbers GetPlayerMapPosition gives * 100.
+ * x/y/z are world coordinates (yards). mapX/mapY are 0-100 map coordinates, the same numbers
+ * GetPlayerMapPosition gives * 100: the zone map, or inside an instance the floor of its dungeon map when
+ * the dungeon maps of the WDM patch are loaded (Coordinates.DungeonMapDir). worldMapAreaId and floor are
+ * what GetCurrentMapAreaID and GetCurrentMapDungeonLevel give on that map.
  */
 
 #include "Chat.h"
@@ -37,10 +40,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -50,9 +55,10 @@ namespace
     bool sPlayerCommand = true;
     uint32 sMinInterval = 200;
     std::string sExportPath = "coordinates_export.lua";
+    std::string sDungeonMapDir;
 
     constexpr char const* ADDON_PREFIX = "AQCOORD";
-    constexpr uint32 PROTOCOL_VERSION = 1;
+    constexpr uint32 PROTOCOL_VERSION = 2;
     constexpr uint32 MAX_INTERVAL = 10000;
     constexpr char const* STREAM_KEY = "CoordinatesStream";
     // A client chat message holds 255 bytes; keep the prefix, tab and terminator inside that.
@@ -181,6 +187,238 @@ namespace
         WorldPacket data;
         ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, player, player, message);
         player->SendDirectMessage(&data);
+    }
+
+    // ---- dungeon maps from the WDM patch (github.com/Trimitor/WDM-patch) ----
+    //
+    // The patch gives the 3.3.5 client maps for the classic and TBC instances. Its DBC files say where each
+    // map, and each floor of a map, lies in the world, so the server can give addons the map coordinates the
+    // client shows. The server's own DBCs are not touched: the files are read from Coordinates.DungeonMapDir.
+
+    // A map or one floor of it. A WoW map's left edge is its largest world y and its top edge its largest
+    // world x: DBC "X" runs along world y.
+    struct MapBox
+    {
+        uint32 id = 0;              // DungeonMap row, or the WorldMapArea row of a single-level map
+        uint32 mapId = 0;
+        uint32 floor = 0;           // GetCurrentMapDungeonLevel; 0 on a single-level map
+        uint32 worldMapAreaId = 0;  // GetCurrentMapAreaID
+        float left = 0.0f, right = 0.0f, top = 0.0f, bottom = 0.0f;
+
+        bool Contains(float x, float y) const { return y <= left && y >= right && x <= top && x >= bottom; }
+
+        void ToMap(float x, float y, float& mapX, float& mapY) const
+        {
+            mapX = (left - y) / (left - right) * 100.0f;
+            mapY = (top - x) / (top - bottom) * 100.0f;
+        }
+    };
+
+    struct FloorChunk
+    {
+        uint32 floorId = 0;  // DungeonMap row
+        float minZ = 0.0f;
+    };
+
+    struct DungeonMaps
+    {
+        std::unordered_map<uint32, MapBox> singleLevel;                // instance map -> its whole map
+        std::unordered_map<uint32, std::vector<MapBox>> floors;       // instance map -> its floors
+        std::unordered_map<uint32, MapBox> floorById;
+        std::unordered_map<uint64, std::vector<FloorChunk>> chunks;   // map << 32 | WMO group -> floors
+        std::unordered_map<uint32, uint32> worldMapAreaByMap;         // instance map -> WorldMapArea
+        std::unordered_map<uint32, uint32> worldMapAreaByZone;        // continent zone -> WorldMapArea
+    };
+    DungeonMaps sDungeonMaps;
+
+    struct MapSpot
+    {
+        uint32 worldMapAreaId = 0;
+        uint32 floor = 0;
+        float x = 0.0f, y = 0.0f;
+        bool exact = false;  // the floor came from the building part at the position, not a floor's outline
+    };
+
+    // Boss positions do not move, so a floor found from the building is kept for the server's lifetime.
+    std::map<std::tuple<uint32, int32, int32, int32>, MapSpot> sBossMapCache;
+
+    bool DungeonMapsLoaded()
+    {
+        return !sDungeonMaps.floors.empty() || !sDungeonMaps.singleLevel.empty();
+    }
+
+    using DbcRows = std::vector<std::vector<uint32>>;
+
+    // A WDBC file: a header, records of 4-byte fields, then the strings (not needed here).
+    bool ReadDbc(std::string const& path, uint32 fieldCount, DbcRows& rows)
+    {
+        std::ifstream in(path, std::ios::binary);
+        char magic[4] = {};
+        uint32 header[4] = {};  // records, fields, record size, string block size
+        if (!in.read(magic, sizeof(magic)) || !in.read(reinterpret_cast<char*>(header), sizeof(header)))
+            return false;
+        if (std::memcmp(magic, "WDBC", 4) != 0 || header[1] != fieldCount || header[2] != fieldCount * 4)
+            return false;
+
+        rows.assign(header[0], std::vector<uint32>(fieldCount));
+        for (std::vector<uint32>& row : rows)
+            if (!in.read(reinterpret_cast<char*>(row.data()), fieldCount * 4))
+                return false;
+        return true;
+    }
+
+    float DbcFloat(uint32 value)
+    {
+        float result;
+        std::memcpy(&result, &value, sizeof(result));
+        return result;
+    }
+
+    bool IsContinent(uint32 mapId)
+    {
+        return mapId == 0 || mapId == 1 || mapId == 530 || mapId == 571;
+    }
+
+    void LoadDungeonMaps()
+    {
+        sDungeonMaps = DungeonMaps();
+        sBossMapCache.clear();
+        if (sDungeonMapDir.empty())
+            return;
+
+        std::string dir = sDungeonMapDir;
+        if (dir.back() != '/' && dir.back() != '\\')
+            dir += '/';
+
+        DbcRows areas;
+        DbcRows floors;
+        DbcRows chunks;
+        if (!ReadDbc(dir + "WorldMapArea.dbc", 11, areas) || !ReadDbc(dir + "DungeonMap.dbc", 8, floors) ||
+            !ReadDbc(dir + "DungeonMapChunk.dbc", 5, chunks))
+        {
+            LOG_ERROR("module", "mod-coordinates: {} needs WorldMapArea.dbc, DungeonMap.dbc and DungeonMapChunk.dbc "
+                "from the WDM patch (3.3.5). Dungeon maps are off.", dir);
+            return;
+        }
+
+        // ID, MapID, AreaID, AreaName, LocLeft, LocRight, LocTop, LocBottom, DisplayMapID, DefaultDungeonFloor, ParentWorldMapID
+        for (std::vector<uint32> const& row : areas)
+        {
+            uint32 mapId = row[1];
+            if (IsContinent(mapId))
+            {
+                if (row[2])
+                    sDungeonMaps.worldMapAreaByZone[row[2]] = row[0];
+                continue;
+            }
+
+            sDungeonMaps.worldMapAreaByMap[mapId] = row[0];
+            MapBox box;
+            box.id = row[0];
+            box.mapId = mapId;
+            box.worldMapAreaId = row[0];
+            box.left = DbcFloat(row[4]);
+            box.right = DbcFloat(row[5]);
+            box.top = DbcFloat(row[6]);
+            box.bottom = DbcFloat(row[7]);
+            if (box.left > box.right && box.top > box.bottom)
+                sDungeonMaps.singleLevel[mapId] = box;
+        }
+
+        // ID, MapID, FloorIndex, MinX, MaxX, MinY, MaxY, ParentWorldMapID
+        for (std::vector<uint32> const& row : floors)
+        {
+            MapBox box;
+            box.id = row[0];
+            box.mapId = row[1];
+            box.floor = row[2];
+            auto area = sDungeonMaps.worldMapAreaByMap.find(box.mapId);
+            box.worldMapAreaId = area != sDungeonMaps.worldMapAreaByMap.end() ? area->second : 0;
+            box.left = DbcFloat(row[4]);
+            box.right = DbcFloat(row[3]);
+            box.top = DbcFloat(row[6]);
+            box.bottom = DbcFloat(row[5]);
+            if (box.left <= box.right || box.top <= box.bottom)
+                continue;
+            sDungeonMaps.floors[box.mapId].push_back(box);
+            sDungeonMaps.floorById[box.id] = box;
+        }
+
+        // ID, MapID, WMOGroupID, DungeonMapID, MinZ
+        for (std::vector<uint32> const& row : chunks)
+            sDungeonMaps.chunks[(uint64(row[1]) << 32) | row[2]].push_back({ row[3], DbcFloat(row[4]) });
+
+        LOG_INFO("module", "mod-coordinates: dungeon maps from {}: {} floors of {} instances, {} single-level maps.", dir,
+            sDungeonMaps.floorById.size(), sDungeonMaps.floors.size(), sDungeonMaps.singleLevel.size());
+    }
+
+    // The floor whose building part (WMO group) holds the position, from DungeonMapChunk. The position's
+    // grid must be loaded; `loadGrid` loads it, which only the world thread may do (chat and commands).
+    MapBox const* FloorFromBuilding(Map* map, uint32 mapId, float x, float y, float z, bool loadGrid)
+    {
+        if (!map || map->GetId() != mapId)
+            return nullptr;
+        if (!map->IsGridLoaded(x, y))
+        {
+            if (!loadGrid)
+                return nullptr;
+            map->LoadGrid(x, y);
+        }
+
+        uint32 flags = 0;
+        int32 adtId = 0;
+        int32 rootId = 0;
+        int32 groupId = 0;
+        if (!map->GetAreaInfo(PHASEMASK_NORMAL, x, y, z + 1.0f, flags, adtId, rootId, groupId))
+            return nullptr;
+
+        auto chunkItr = sDungeonMaps.chunks.find((uint64(mapId) << 32) | uint32(groupId));
+        if (chunkItr == sDungeonMaps.chunks.end())
+            return nullptr;
+
+        // A group can lie on several floors split by height: the highest floor starting below the position.
+        FloorChunk const* best = nullptr;
+        for (FloorChunk const& chunk : chunkItr->second)
+            if (chunk.minZ <= z + 1.0f && (!best || chunk.minZ > best->minZ))
+                best = &chunk;
+        if (!best)
+            best = &chunkItr->second.front();
+
+        auto floor = sDungeonMaps.floorById.find(best->floorId);
+        return floor != sDungeonMaps.floorById.end() && floor->second.mapId == mapId ? &floor->second : nullptr;
+    }
+
+    // Where a world position lies on the instance's map, as a client with the WDM patch shows it. The floor
+    // comes from the building part at the position; when that is unknown (grid not loaded, no vmaps, a part
+    // the patch does not list) it is the first floor whose outline holds the position.
+    bool InstanceMapPosition(Map* map, uint32 mapId, float x, float y, float z, bool loadGrid, MapSpot& spot)
+    {
+        auto floors = sDungeonMaps.floors.find(mapId);
+        if (floors == sDungeonMaps.floors.end())
+        {
+            auto single = sDungeonMaps.singleLevel.find(mapId);
+            if (single == sDungeonMaps.singleLevel.end() || !single->second.Contains(x, y))
+                return false;
+            spot.worldMapAreaId = single->second.worldMapAreaId;
+            spot.floor = 0;
+            spot.exact = true;
+            single->second.ToMap(x, y, spot.x, spot.y);
+            return true;
+        }
+
+        MapBox const* chosen = FloorFromBuilding(map, mapId, x, y, z, loadGrid);
+        spot.exact = chosen != nullptr;
+        if (!chosen)
+            for (MapBox const& box : floors->second)
+                if (box.Contains(x, y) && (!chosen || box.floor < chosen->floor))
+                    chosen = &box;
+        if (!chosen)
+            return false;
+
+        spot.worldMapAreaId = chosen->worldMapAreaId;
+        spot.floor = chosen->floor;
+        chosen->ToMap(x, y, spot.x, spot.y);
+        return true;
     }
 
     // ---- creature spawns per instance map, indexed once ----
@@ -325,6 +563,29 @@ namespace
         return result;
     }
 
+    // A boss on the instance's dungeon map. Without `map` (the export) only floors found earlier in an
+    // instance are exact; the others come from the floors' outlines.
+    bool BossMapPosition(Map* map, uint32 mapId, BossSpot const& boss, bool loadGrid, MapSpot& spot)
+    {
+        if (!boss.hasPosition || !DungeonMapsLoaded())
+            return false;
+
+        auto key = std::make_tuple(mapId, int32(std::lround(boss.x * 10.0f)), int32(std::lround(boss.y * 10.0f)),
+            int32(std::lround(boss.z * 10.0f)));
+        auto cached = sBossMapCache.find(key);
+        if (cached != sBossMapCache.end())
+        {
+            spot = cached->second;
+            return true;
+        }
+
+        if (!InstanceMapPosition(map, mapId, boss.x, boss.y, boss.z, loadGrid, spot))
+            return false;
+        if (spot.exact)
+            sBossMapCache[key] = spot;
+        return true;
+    }
+
     // Where the instance is entered from the world: the area triggers that teleport into it.
     std::vector<Entrance> FindEntrances(uint32 instanceMapId)
     {
@@ -371,16 +632,37 @@ namespace
         uint32 areaId = 0;
         player->GetZoneAndAreaId(zoneId, areaId);
 
-        float mapX = 0.0f;
-        float mapY = 0.0f;
-        bool hasMap = ZoneMapPosition(zoneId, player->GetPositionX(), player->GetPositionY(), mapX, mapY);
+        // Runs in the map's own update thread (the stream), so it never loads a grid: the player's is loaded.
+        Map* map = player->GetMap();
+        MapSpot spot;
+        bool hasMap = false;
+        std::string worldMapArea = "-";
+        std::string floor = "-";
+        if (map->IsDungeon() && InstanceMapPosition(map, map->GetId(), player->GetPositionX(), player->GetPositionY(),
+            player->GetPositionZ(), false, spot))
+        {
+            hasMap = true;
+            worldMapArea = std::to_string(spot.worldMapAreaId);
+            floor = std::to_string(spot.floor);
+        }
+        else
+        {
+            hasMap = ZoneMapPosition(zoneId, player->GetPositionX(), player->GetPositionY(), spot.x, spot.y);
+            auto area = sDungeonMaps.worldMapAreaByZone.find(zoneId);
+            if (hasMap && area != sDungeonMaps.worldMapAreaByZone.end())
+            {
+                worldMapArea = std::to_string(area->second);
+                floor = "0";
+            }
+        }
 
         std::ostringstream ss;
         ss << "POS " << player->GetMapId() << ' ' << zoneId << ' ' << areaId << ' '
            << Fixed(player->GetPositionX(), 1) << ' ' << Fixed(player->GetPositionY(), 1) << ' '
            << Fixed(player->GetPositionZ(), 1) << ' ' << Fixed(player->GetOrientation(), 3) << ' '
-           << (player->GetMap()->IsDungeon() ? 1 : 0) << ' '
-           << (hasMap ? Fixed(mapX, 2) : "-") << ' ' << (hasMap ? Fixed(mapY, 2) : "-");
+           << (map->IsDungeon() ? 1 : 0) << ' '
+           << (hasMap ? Fixed(spot.x, 2) : "-") << ' ' << (hasMap ? Fixed(spot.y, 2) : "-") << ' '
+           << worldMapArea << ' ' << floor;
         SendAddon(player, ss.str());
     }
 
@@ -408,6 +690,13 @@ namespace
                << (boss.hasPosition ? Fixed(boss.y, 1) : "-") << ' '
                << (boss.hasPosition ? Fixed(boss.z, 1) : "-") << ' ' << boss.name;
             SendAddon(player, ss.str());
+
+            // A line of its own, so addons that read BOSS up to the name keep working.
+            MapSpot spot;
+            if (BossMapPosition(map, map->GetId(), boss, true, spot))
+                SendAddon(player, "BOSSMAP " + std::to_string(boss.encounterIndex) + ' ' + std::to_string(spot.worldMapAreaId) +
+                    ' ' + std::to_string(spot.floor) + ' ' + Fixed(spot.x, 2) + ' ' + Fixed(spot.y, 2) + ' ' +
+                    (spot.exact ? "1" : "0"));
         }
         SendAddon(player, "BOSSEND " + std::to_string(map->GetId()) + ' ' + std::to_string(map->GetDifficulty()) + ' ' +
             std::to_string(bosses.size()));
@@ -421,7 +710,8 @@ namespace
 
         if (command == "HELLO")
         {
-            SendAddon(player, "HELLO " + std::to_string(PROTOCOL_VERSION) + " POS,WHERE,BOSSES");
+            SendAddon(player, "HELLO " + std::to_string(PROTOCOL_VERSION) + " POS,WHERE,BOSSES" +
+                (DungeonMapsLoaded() ? ",MAPS" : ""));
         }
         else if (command == "POS")
         {
@@ -459,8 +749,10 @@ namespace
 
         out << "-- Generated by mod-coordinates (.coords export) from the AzerothCore server data.\n"
                "-- entrances: zone map coordinates (0-100) of the area triggers that lead into the instance.\n"
-               "-- bosses: world coordinates (yards) inside the instance; most 3.3.5 instances have no map,\n"
-               "-- so compare them with the position mod-coordinates sends (AQCOORD POS).\n"
+               "-- bosses: world coordinates (yards) inside the instance. With the WDM patch's dungeon maps loaded\n"
+               "-- (Coordinates.DungeonMapDir) also mapX/mapY on worldMapAreaId (GetCurrentMapAreaID) and floor\n"
+               "-- (GetCurrentMapDungeonLevel). exactFloor = false: the floor is a guess from the floors' outlines,\n"
+               "-- because no player has been near the boss since the server started; .coords bosses there makes it exact.\n"
                "AzerothCoordinates = {\n";
 
         instanceCount = 0;
@@ -495,6 +787,11 @@ namespace
                     << ", entry = " << boss.entry << ", difficultyMask = " << uint32(boss.difficultyMask);
                 if (boss.hasPosition)
                     out << ", x = " << Fixed(boss.x, 1) << ", y = " << Fixed(boss.y, 1) << ", z = " << Fixed(boss.z, 1);
+                MapSpot spot;
+                if (BossMapPosition(nullptr, mapId, boss, false, spot))
+                    out << ", worldMapAreaId = " << spot.worldMapAreaId << ", floor = " << spot.floor << ", mapX = "
+                        << Fixed(spot.x, 2) << ", mapY = " << Fixed(spot.y, 2) << ", exactFloor = "
+                        << (spot.exact ? "true" : "false");
                 out << "},\n";
             }
             out << "\t\t},\n\t},\n";
@@ -515,6 +812,8 @@ public:
         sPlayerCommand = sConfigMgr->GetOption<bool>("Coordinates.PlayerCommand", true);
         sMinInterval = std::clamp<uint32>(sConfigMgr->GetOption<uint32>("Coordinates.MinInterval", 200), 100, MAX_INTERVAL);
         sExportPath = sConfigMgr->GetOption<std::string>("Coordinates.ExportPath", "coordinates_export.lua");
+        sDungeonMapDir = sConfigMgr->GetOption<std::string>("Coordinates.DungeonMapDir", "");
+        LoadDungeonMaps();
     }
 };
 
@@ -625,6 +924,19 @@ public:
         handler->PSendSysMessage("World: x {} y {} z {} facing {}", Fixed(player->GetPositionX(), 1),
             Fixed(player->GetPositionY(), 1), Fixed(player->GetPositionZ(), 1), Fixed(player->GetOrientation(), 2));
 
+        MapSpot spot;
+        if (map->IsDungeon() && InstanceMapPosition(map, map->GetId(), player->GetPositionX(), player->GetPositionY(),
+            player->GetPositionZ(), true, spot))
+        {
+            handler->PSendSysMessage("Dungeon map {}{}: {}, {} ({})", spot.worldMapAreaId,
+                spot.floor ? ", floor " + std::to_string(spot.floor) : "", Fixed(spot.x, 2), Fixed(spot.y, 2),
+                !spot.floor ? "single-level map" : spot.exact ? "floor from the building" : "floor guessed from the outline");
+            handler->PSendSysMessage("{{worldMapAreaId = {}, floor = {}, x = {}, y = {}}}", spot.worldMapAreaId, spot.floor,
+                Fixed(spot.x, 2), Fixed(spot.y, 2));
+        }
+        else if (map->IsDungeon() && !DungeonMapsLoaded())
+            handler->SendSysMessage("Dungeon map: not loaded - set Coordinates.DungeonMapDir to the WDM patch's DBC files.");
+
         float mapX = 0.0f;
         float mapY = 0.0f;
         if (ZoneMapPosition(zoneId, player->GetPositionX(), player->GetPositionY(), mapX, mapY))
@@ -640,7 +952,7 @@ public:
                 handler->PSendSysMessage("{}", WaypointLine(here, AreaName(areaId)));
             }
         }
-        else
+        else if (!map->IsDungeon() || !DungeonMapsLoaded())
             handler->SendSysMessage("Zone map: none - the 3.3.5 client has no map here; addons need the world position.");
 
         if (map->IsDungeon())
@@ -675,9 +987,14 @@ public:
         for (BossSpot const& boss : bosses)
         {
             std::string state = (completed & (1 << boss.encounterIndex)) ? "done" : "open";
+            MapSpot spot;
+            std::string onMap;
+            if (BossMapPosition(map, map->GetId(), boss, true, spot))
+                onMap = " - map " + Fixed(spot.x, 1) + ", " + Fixed(spot.y, 1) +
+                    (spot.floor ? " floor " + std::to_string(spot.floor) + (spot.exact ? "" : "?") : "");
             if (boss.hasPosition)
-                handler->PSendSysMessage("  {}. {} ({}) - x {} y {} z {}, {:.0f} yards", boss.encounterIndex + 1, boss.name,
-                    state, Fixed(boss.x, 1), Fixed(boss.y, 1), Fixed(boss.z, 1), player->GetDistance(boss.x, boss.y, boss.z));
+                handler->PSendSysMessage("  {}. {} ({}) - x {} y {} z {}, {:.0f} yards{}", boss.encounterIndex + 1, boss.name,
+                    state, Fixed(boss.x, 1), Fixed(boss.y, 1), Fixed(boss.z, 1), player->GetDistance(boss.x, boss.y, boss.z), onMap);
             else
                 handler->PSendSysMessage("  {}. {} ({}) - no spawn (summoned or scripted)", boss.encounterIndex + 1,
                     boss.name, state);

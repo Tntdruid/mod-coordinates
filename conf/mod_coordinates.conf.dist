@@ -25,3 +25,13 @@ Coordinates.MinInterval = 200
 #     Description: File written by .coords export, relative to the worldserver folder.
 #     Default:     "coordinates_export.lua"
 Coordinates.ExportPath = "coordinates_export.lua"
+
+# Coordinates.DungeonMapDir
+#     Description: Folder with the dungeon map files of the WDM patch
+#                  (https://github.com/Trimitor/WDM-patch, Stable/<locale>/DBFilesClient):
+#                  WorldMapArea.dbc, DungeonMap.dbc and DungeonMapChunk.dbc. With them the module
+#                  also gives map coordinates and the floor inside dungeons and raids, the same
+#                  numbers a client with the patch shows. The server's own DBCs are not touched.
+#     Default:     "" - (Off)
+#     Example:     "/home/acore/azerothcore-wotlk/env/dist/data/wdm"
+Coordinates.DungeonMapDir = ""

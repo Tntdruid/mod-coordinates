@@ -23,12 +23,25 @@ inside a dungeon or raid an arrow points at the next boss still alive, in encoun
 
 No SQL is needed.
 
+### Dungeon maps (optional)
+
+The [WDM patch](https://github.com/Trimitor/WDM-patch) gives the 3.3.5 client maps for the classic and TBC
+dungeons and raids. Point the module at the patch's map files and it also gives map coordinates and the floor
+inside instances, the same numbers a client with the patch shows, so addons can put bosses on those maps:
+
+1. Copy `WorldMapArea.dbc`, `DungeonMap.dbc` and `DungeonMapChunk.dbc` from the patch repository's
+   `Stable/enUS/DBFilesClient` folder (any locale works; only numbers are read) to a folder on the server.
+2. Set `Coordinates.DungeonMapDir` to that folder. The worldserver log says how many floors were loaded.
+
+The floor comes from the building part (WMO group) at the position, which needs vmaps. Where that is unknown
+the floor is guessed from the floors' outlines; `.coords` says which.
+
 ## Commands
 
 | Command | Who | What |
 | --- | --- | --- |
-| `.coords` | players (or GMs, see config) | Map, zone and area, world x/y/z, zone map coordinates and a ready `waypoint(...)` line in AzerothQuest's guide format. Inside an instance it prints the entrance instead. |
-| `.coords bosses` | players (or GMs) | The bosses of the current instance: done/open, position and distance. |
+| `.coords` | players (or GMs, see config) | Map, zone and area, world x/y/z, zone map coordinates and a ready `waypoint(...)` line in AzerothQuest's guide format. Inside an instance it prints the entrance instead, and with dungeon maps loaded the dungeon map, floor and coordinates. |
+| `.coords bosses` | players (or GMs) | The bosses of the current instance: done/open, position, distance and, with dungeon maps, map coordinates and floor. |
 | `.coords export` | administrators, also from the console | Writes `coordinates_export.lua` with every dungeon and raid: entrances in zone map coordinates and bosses in world coordinates. |
 
 ## Addon protocol
@@ -42,20 +55,24 @@ SendAddonMessage("AQCOORD", "POS 250", "WHISPER", UnitName("player"))
 
 | Addon sends | Server answers |
 | --- | --- |
-| `HELLO` | `HELLO <protocol> POS,WHERE,BOSSES` |
+| `HELLO` | `HELLO <protocol> POS,WHERE,BOSSES[,MAPS]` (MAPS: dungeon maps loaded) |
 | `POS <ms>` | `POS` lines every `<ms>` (at least `Coordinates.MinInterval`) while in a dungeon or raid, only when the player moved or turned. `POS 0` stops. |
 | `POS <ms> ALL` | The same, everywhere. |
 | `WHERE` | One `POS` line now. |
-| `BOSSES` | One `BOSS` line per encounter, then `BOSSEND`. |
+| `BOSSES` | One `BOSS` line per encounter (with dungeon maps also a `BOSSMAP` line), then `BOSSEND`. |
 
 ```
-POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|->
+POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|-> <worldMapAreaId|-> <floor|->
 BOSS <encounterIndex> <done 0/1> <entry> <x|-> <y|-> <z|-> <name>
+BOSSMAP <encounterIndex> <worldMapAreaId> <floor> <mapX> <mapY> <exact 0/1>
 BOSSEND <map> <difficulty> <count>
 ```
 
 - `x y z` are world coordinates in yards, `facing` is in radians (the same as `GetPlayerFacing()`).
-- `mapX mapY` are 0-100 zone map coordinates when the zone has a world map, otherwise `-`.
+- `mapX mapY` are 0-100 map coordinates, otherwise `-`: the zone map, or inside an instance the dungeon map
+  floor when dungeon maps are loaded. `worldMapAreaId` and `floor` are what `GetCurrentMapAreaID()` and
+  `GetCurrentMapDungeonLevel()` give there (protocol 2; protocol 1 ended after `mapY`).
+- `BOSSMAP` puts a boss on the dungeon map; `exact 0` means its floor is guessed from the outlines.
 - A boss is found by its encounter's credit creature, or else by a spawn with the encounter's name (Valithria
   Dreamwalker, credited by a spell). It has no position (`-`) when it is summoned during the fight (Sindragosa)
   or is no single creature (Icecrown Gunship Battle).
