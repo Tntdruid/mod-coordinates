@@ -63,7 +63,7 @@ SendAddonMessage("AQCOORD", "POS 250", "WHISPER", UnitName("player"))
 
 ```
 POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|-> <worldMapAreaId|-> <floor|->
-BOSS <encounterIndex> <done 0/1> <entry> <x|-> <y|-> <z|-> <name>
+BOSS <encounterIndex> <state> <entry> <x|-> <y|-> <z|-> <name>
 BOSSMAP <encounterIndex> <worldMapAreaId> <floor> <mapX> <mapY> <exact 0/1>
 BOSSEND <map> <difficulty> <count>
 ```
@@ -72,6 +72,8 @@ BOSSEND <map> <difficulty> <count>
 - `mapX mapY` are 0-100 map coordinates, otherwise `-`: the zone map, or inside an instance the dungeon map
   floor when dungeon maps are loaded. `worldMapAreaId` and `floor` are what `GetCurrentMapAreaID()` and
   `GetCurrentMapDungeonLevel()` give there (protocol 2; protocol 1 ended after `mapY`).
+- `state` is 0 open, 1 done, 2 friendly to you: a boss of a faction friendly to the player, who cannot fight
+  it (the Lost Dwarves in Uldaman for the Alliance), so its encounter never ends for them. Pass it by.
 - `BOSSMAP` puts a boss on the dungeon map; `exact 0` means its floor is guessed from the outlines.
 - A boss is found by its encounter's credit creature, or else by a spawn with the encounter's name (Valithria
   Dreamwalker, credited by a spell). It has no position (`-`) when it is summoned during the fight (Sindragosa)

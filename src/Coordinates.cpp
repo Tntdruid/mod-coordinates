@@ -12,7 +12,7 @@
  *
  *   server -> addon  (CHAT_MSG_ADDON, prefix "AQCOORD", whispered from the player to themself)
  *     POS <map> <zone> <area> <x> <y> <z> <facing> <instance 0/1> <mapX|-> <mapY|-> <worldMapAreaId|-> <floor|->
- *     BOSS <encounterIndex> <done 0/1> <entry> <x|-> <y|-> <z|-> <name>
+ *     BOSS <encounterIndex> <state 0 open/1 done/2 friendly to you> <entry> <x|-> <y|-> <z|-> <name>
  *     BOSSMAP <encounterIndex> <worldMapAreaId> <floor> <mapX> <mapY> <exact 0/1>   (dungeon maps loaded)
  *     BOSSEND <map> <difficulty> <count>
  *
@@ -563,6 +563,24 @@ namespace
         return result;
     }
 
+    // A boss whose faction is friendly to the player cannot be fought by them (the Lost Dwarves in Uldaman
+    // for the Alliance), so its encounter never ends for them and an addon should pass it by.
+    bool FriendlyToPlayer(Player* player, BossSpot const& boss)
+    {
+        CreatureTemplate const* info = boss.entry ? sObjectMgr->GetCreatureTemplate(boss.entry) : nullptr;
+        FactionTemplateEntry const* bossFaction = info ? sFactionTemplateStore.LookupEntry(info->faction) : nullptr;
+        FactionTemplateEntry const* playerFaction = player->GetFactionTemplateEntry();
+        return bossFaction && playerFaction && bossFaction->IsFriendlyTo(*playerFaction);
+    }
+
+    // 0 open, 1 done, 2 friendly to this player (BOSS lines; protocol 1 addons read only "1" as done).
+    int BossState(Player* player, uint32 completed, BossSpot const& boss)
+    {
+        if (completed & (1 << boss.encounterIndex))
+            return 1;
+        return FriendlyToPlayer(player, boss) ? 2 : 0;
+    }
+
     // A boss on the instance's dungeon map. Without `map` (the export) only floors found earlier in an
     // instance are exact; the others come from the floors' outlines.
     bool BossMapPosition(Map* map, uint32 mapId, BossSpot const& boss, bool loadGrid, MapSpot& spot)
@@ -684,7 +702,7 @@ namespace
         for (BossSpot const& boss : bosses)
         {
             std::ostringstream ss;
-            ss << "BOSS " << boss.encounterIndex << ' ' << ((completed & (1 << boss.encounterIndex)) ? 1 : 0) << ' '
+            ss << "BOSS " << boss.encounterIndex << ' ' << BossState(player, completed, boss) << ' '
                << boss.entry << ' '
                << (boss.hasPosition ? Fixed(boss.x, 1) : "-") << ' '
                << (boss.hasPosition ? Fixed(boss.y, 1) : "-") << ' '
@@ -986,7 +1004,8 @@ public:
         handler->PSendSysMessage("{}: {} bosses.", MapName(map->GetId()), bosses.size());
         for (BossSpot const& boss : bosses)
         {
-            std::string state = (completed & (1 << boss.encounterIndex)) ? "done" : "open";
+            int bossState = BossState(player, completed, boss);
+            std::string state = bossState == 1 ? "done" : bossState == 2 ? "friendly to you" : "open";
             MapSpot spot;
             std::string onMap;
             if (BossMapPosition(map, map->GetId(), boss, true, spot))
