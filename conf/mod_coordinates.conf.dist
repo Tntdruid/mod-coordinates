@@ -1,0 +1,27 @@
+[worldserver]
+
+# Coordinates.Enable
+#     Description: Answers addons (AzerothQuest) that ask for the player's position inside
+#                  dungeons and raids, where the 3.3.5 client has no map, and for the bosses
+#                  of the instance (addon prefix AQCOORD).
+#     Default:     1 - (Enabled)
+#                  0 - (Disabled)
+Coordinates.Enable = 1
+
+# Coordinates.PlayerCommand
+#     Description: Lets every player use .coords and .coords bosses. Off: game masters only.
+#                  .coords export is always for administrators.
+#     Default:     1 - (Enabled)
+#                  0 - (Game masters only)
+Coordinates.PlayerCommand = 1
+
+# Coordinates.MinInterval
+#     Description: Shortest time in milliseconds between two positions sent to an addon.
+#                  A position is only sent when the player moved or turned.
+#     Default:     200
+Coordinates.MinInterval = 200
+
+# Coordinates.ExportPath
+#     Description: File written by .coords export, relative to the worldserver folder.
+#     Default:     "coordinates_export.lua"
+Coordinates.ExportPath = "coordinates_export.lua"
